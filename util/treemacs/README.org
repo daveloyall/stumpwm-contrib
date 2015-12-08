@@ -1,0 +1,14 @@
+# TREEMACS
+
+This is an emacs-like toy that runs atop StumpWM.  "Emacs-like" means
+"in the spirit of emacs", which in turn means "edit the editor with
+the editor", rather than "the default keybindings are somewhat like
+the default keybindings of emacs".
+
+What is generally atop a stump?  A tree, of course!  Thus the name.
+
+* TODO find code that stumpwm uses for `C-t ;` and other command which implement line editing and borrow it.
+* TODO find code that implements keybinding and borrow it.  It already has "modes".
+* TODO determine if stumpwm already is treemacs... :)
+
+
