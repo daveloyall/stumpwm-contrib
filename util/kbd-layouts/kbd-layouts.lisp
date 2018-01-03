@@ -14,6 +14,12 @@
 ;; :swapped-> Swap Ctrl and CapsLock
 (defvar *caps-lock-behavior* nil)
 
+;; Custom option string appended to setxkbmap
+(defvar *custom-setxkb-options* nil)
+
+;; Run xmodmap ~/.Xmodmap each time layouts are switched
+(defvar *run-xmodmap* t)
+
 ;;;;;;;;;;;;;;;;;;;;;;
 ;; Helper functions ;;
 ;;;;;;;;;;;;;;;;;;;;;;
@@ -40,14 +46,17 @@
 ;;;;;;;;;;;;;;
 
 (defcommand switch-keyboard-layout () ()
+  "Perform the actual layout switching."
   (let* ((layout (pop *available-keyboard-layouts*))
          (caps (ecase
                    *caps-lock-behavior*
                  (:normal "caps:capslock")
                  (:ctrl "ctrl:nocaps")
                  (:swapped "ctrl:swapcaps")))
-         (cmd (format nil "setxkbmap ~a -option ~a" layout caps)))
-    (run-shell-command cmd t)
+         (cmd (format nil "setxkbmap ~a -option ~a~@[ ~a~]" layout caps *custom-setxkb-options*)))
+    (run-shell-command cmd nil)
+    (when *run-xmodmap*
+      (run-shell-command "xmodmap ~/.Xmodmap"))
     (message (format nil "Keyboard layout switched to: ~a" layout))))
 
 ;;;;;;;;;;;;;;
