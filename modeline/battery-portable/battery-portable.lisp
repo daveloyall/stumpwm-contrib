@@ -42,8 +42,16 @@
   "Time in seconds between updates of battery information.")
 
 (defvar *prefer-sysfs* t
-  "Prefer sysfs over procfs for information gathering. This has effect
-  only on Linux.")
+  "This has no effect. Legacy purposes only.")
+
+(defvar *preferred-drivers-failed* nil
+  "T when the preferred battery method cannot find info.")
+
+(defvar *non-preferred-drivers-failed* nil
+  "T when the non-preferred battery method cannot find info.")
+
+(defvar *no-battery-info* "(no battery info)"
+  "Message to give when no battery info is found.")
 
 ;;; Method base class
 
@@ -54,11 +62,11 @@
 (defgeneric all-batteries (method)
   (:documentation "Returns all recognized batteries."))
 
-(defun preferred-battery-method ()
+(defun preferred-battery-method (&optional (sysfs t))
   #- (or linux openbsd)
   nil
   #+ linux
-  (if *prefer-sysfs*
+  (if sysfs
       (make-instance 'sysfs-method)
       (make-instance 'procfs-method))
   #+ openbsd
@@ -164,22 +172,15 @@
     ((path :initarg :path :initform (error ":path missing")
            :reader path-of)))
 
-  (defun sysfs-field-exists? (path name)
-    (probe-file (merge-pathnames (make-pathname :name name)
-                                 path)))
-
   (defun sysfs-field (path name)
     (with-open-file (file (merge-pathnames (make-pathname :name name)
                                            path))
       (read-line-from-sysfs file)))
 
   (defun sysfs-int-field (path name)
-    (parse-integer (sysfs-field path name) :junk-allowed t))
-
-  (defun sysfs-int-field-or-nil (path name)
-    (if (sysfs-field-exists? path name)
-        (sysfs-int-field path name)
-        nil))
+    (handler-case (parse-integer (sysfs-field path name) :junk-allowed t)
+      (file-error () nil)
+      (simple-error () nil)))
 
   (defmethod all-batteries ((m sysfs-method))
     (remove nil
@@ -194,35 +195,58 @@
 
   (defmethod state-of ((battery sysfs-battery))
     (handler-case
-        (let ((path (path-of battery)))
-          (if (string= (sysfs-field path "present") "0")
+        (let* ((path (path-of battery))
+               (present (sysfs-field path "present")))
+          (if (or (not present) (string= present "0"))
               :unknown
-              (let* ((state (sysfs-field path "status"))
-                     (consumption (or (sysfs-int-field-or-nil path "power_now")
-                                      (sysfs-int-field-or-nil path "current_now")
-                                      (return-from state-of :unknown)))
-                     (curr (or (sysfs-int-field-or-nil path "energy_now")
-                               ;; energy_* seems not to be there on
-                               ;; some boxes. Strange...
-                               (sysfs-int-field-or-nil path "charge_now")
-                               (return-from state-of :unknown)))
-                     (full (or (sysfs-int-field-or-nil path "energy_full")
-                               (sysfs-int-field-or-nil path "charge_full")
-                               (return-from state-of :unknown)))
-                     (percent (* 100 (/ curr full))))
-                (cond
-                  ((string= state "Full") (values :charged percent))
-                  ((string= state "Discharging")
-                   (values :discharging percent
-                           (if (zerop consumption)
-                               0
-                               (* 3600 (/ curr consumption)))))
-                  ((string= state "Charging")
-                   (values :charging percent
-                           (if (zerop consumption)
-                               0
-                               (* 3600 (/ (- full curr) consumption)))))
-                  (t :unknown)))))
+              (labels ((full ()
+                         (or (sysfs-int-field path "energy_full")
+                             (sysfs-int-field path "charge_full")))
+                       (curr ()
+                         (or (sysfs-int-field path "energy_now")
+                             ;; energy_* seems not to be there on
+                             ;; some boxes. Strange...
+                             (sysfs-int-field path "charge_now")))
+                       (consumption ()
+                         (or (sysfs-int-field path "power_now")
+                             (sysfs-int-field path "current_now")))
+                       (capacity-native ()
+                         (sysfs-int-field path "capacity"))
+                       (capacity-calculate ()
+                         (let ((curr (curr))
+                               (full (full)))
+                           (and curr full
+                                (* 100 (/ curr full)))))
+                       (capacity-level ()
+                         (sysfs-field path "capacity_level")))
+                (let ((capacity (or (capacity-native)  ;Try better options first.
+                                    (capacity-calculate)
+                                    (capacity-level))))
+                  (if (null capacity)
+                      :unknown
+                      (let* ((state (sysfs-field path "status"))
+                             (state (or (and (stringp state)
+                                             (cond ((string= state "Charging") :charging)
+                                                   ((string= state "Discharging") :discharging)
+                                                   ((string= state "Full") :charged)
+                                                   (t :unknown)))
+                                        :unknown)))
+                        (values state
+                                capacity
+                                (let ((full (full))
+                                      (curr (curr))
+                                      (consumption (consumption)))
+                                  (if (or (null consumption)
+                                          (null full)
+                                          (null curr)
+                                          (zerop consumption))
+                                      0
+                                      (cond
+                                        ((eql state :charged) nil)
+                                        ((eql state :discharging)
+                                         (* 3600 (/ curr consumption)))
+                                        ((eql state :charging)
+                                         (* 3600 (/ (- full curr) consumption)))))))))))))
       (t () :unknown))))
 
 ;;; OpenBSD /usr/sbin/apm implementation
@@ -285,7 +309,8 @@
 
 (defun fmt-time (stream arg colonp atp)
   (declare (ignore colonp atp))
-  (when (numberp arg)
+  (when (and (numberp arg)
+             (plusp arg))
     (multiple-value-bind (hours rest)
         (truncate arg 3600)
       (format stream "~D:~2,'0D" hours (floor rest 60)))))
@@ -293,24 +318,47 @@
 (defun battery-info-string ()
   "Compiles a string suitable for StumpWM's mode-line."
   (with-output-to-string (fmt)
-    (let ((batteries (all-batteries (or (preferred-battery-method)
-                                        (return-from battery-info-string
-                                          "(not implemented)")))))
-      (if (endp batteries)
-          (format fmt "(no battery)")
-          (loop
+    (let ((current-fs (cond ((and *preferred-drivers-failed*
+                                  *non-preferred-drivers-failed*)
+                             (return-from battery-info-string
+                               "(not implemented)"))
+                            ((and *preferred-drivers-failed*
+                                  (not *non-preferred-drivers-failed*))
+                             nil)
+                            (t t))))
+      (let ((batteries (all-batteries (preferred-battery-method current-fs))))
+       (if (endp batteries)
+           (progn (format fmt "~A" *no-battery-info*)
+                  (if current-fs
+                      (setf *preferred-drivers-failed* t)
+                      (setf *non-preferred-drivers-failed* t)))
+           (loop
              for bat in batteries
              do (multiple-value-bind (state perc time)
                     (state-of bat)
                   (ecase state
-                    (:unknown (format fmt "(no info)"))
-                    (:charged (format fmt "~~ ~D%" (round perc)))
+                    (:unknown (format fmt "~A" *no-battery-info*))
+                    (:charged (etypecase perc
+                                (string (format fmt "~~ ~A" perc))
+                                (number (format fmt "~~ ~D%" (round perc)))))
                     ((:charging :discharging)
-                     (format fmt "~/battery-portable::fmt-time/~A ^[~A~D%^]"
-                             time
-                             (if (eq state :charging) #\+ #\-)
-                             (bar-zone-color perc 90 50 20 t)
-                             (round perc))))))))))
+                     (etypecase perc
+                       (string (format fmt "~/battery-portable::fmt-time/~A ^[~A~A^]"
+                                       time
+                                       (if (eq state :charging) #\+ #\-)
+                                       (bar-zone-color (cond ((or (string= "Low" perc)
+                                                                  (string= "Critical" perc)
+                                                                  (string= "Unknown" perc)) 19)
+                                                             ((string= "Normal" perc) 50)
+                                                             ((or (string= "High" perc)
+                                                                  (string= "Full" perc)) 91))
+                                                       90 50 20 t)
+                                       perc))
+                       (number (format fmt "~/battery-portable::fmt-time/~A ^[~A~A%^]"
+                                       time
+                                       (if (eq state :charging) #\+ #\-)
+                                       (bar-zone-color perc 90 50 20 t)
+                                       (round perc)))))))))))))
 
 ;;; The actual mode-line format function. A bit ugly...
 (let ((next 0)

@@ -1,6 +1,6 @@
 Notifications server for StumpWM.
 
-Implements =org.freedesktop.Notifications= interface.
+Implements =org.freedesktop.Notifications= interface[fn:dbus-spec].
 Shows notifications using =stumpwm:message= by default.
 
 ** Usage
@@ -34,6 +34,14 @@ Then you need to install the dev package:
   apt-get install -y libfixposix-dev
 #+END_SRC
 
+** Testing
+You can test notifications (if you have notify-send installed) with:
+#+BEGIN_SRC sh
+notify-send 'Hello world!' 'This is an example notification.'
+#+END_SRC
+
 * Footnotes
 
 [fn:1] ...and possibly other distributions too
+
+[fn:dbus-spec] [[https://specifications.freedesktop.org/notification-spec/latest/ar01s09.html][D-BUS Notifications Protocol Spec]]
